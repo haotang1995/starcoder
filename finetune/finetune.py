@@ -24,6 +24,7 @@ class SavePeftModelCallback(TrainerCallback):
         **kwargs,
     ):
         checkpoint_folder = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
+        print(f"Saving peft model to {checkpoint_folder}.")
 
         kwargs["model"].save_pretrained(checkpoint_folder)
 
@@ -41,12 +42,15 @@ class LoadBestPeftModelCallback(TrainerCallback):
         **kwargs,
     ):
         print(f"Loading best peft model from {state.best_model_checkpoint} (score: {state.best_metric}).")
+        # if state.best_model_checkpoint is None:
+            # print("Error: No best model checkpoint found. Skipping.")
+            # return control
         best_model_path = os.path.join(state.best_model_checkpoint, "adapter_model.bin")
         adapters_weights = torch.load(best_model_path)
         model = kwargs["model"]
         set_peft_model_state_dict(model, adapters_weights)
         return control
-    
+
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -76,7 +80,7 @@ def get_args():
     parser.add_argument("--num_warmup_steps", type=int, default=100)
     parser.add_argument("--weight_decay", type=float, default=0.05)
 
-    parser.add_argument("--local_rank", type=int, default=0)
+    parser.add_argument("--local-rank", type=int, default=0)
     parser.add_argument("--no_fp16", action="store_false")
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--no_gradient_checkpointing", action="store_false", default=False)
@@ -284,6 +288,7 @@ def run_training(args, train_data, val_data):
         run_name="StarCoder-finetuned",
         report_to="wandb",
         ddp_find_unused_parameters=False,
+        load_best_model_at_end=True,
     )
 
     trainer = Trainer(model=model, args=training_args, train_dataset=train_data, eval_dataset=val_data, callbacks=[SavePeftModelCallback, LoadBestPeftModelCallback])
@@ -303,6 +308,7 @@ def main(args):
 
 if __name__ == "__main__":
     args = get_args()
+    print(args)
 
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
