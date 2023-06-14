@@ -20,13 +20,6 @@ from transformers.trainer import logger, is_sagemaker_mp_enabled, load_sharded_c
 class MyTrainer(Trainer):
     def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
         return
-        print('wwwww', resume_from_checkpoint)
-        assert(model is None)
-
-        logger.info(f"Loading model from {resume_from_checkpoint}.")
-        config = PeftConfig.from_pretrained(resume_from_checkpoint)
-        model = AutoModelForCausalLM.from_pretrained(config.base_model_name_or_path)
-        self.model = PeftModel.from_pretrained(model, resume_from_checkpoint)
 
 class LoadBestPeftModelCallback(TrainerCallback):
     def on_train_end(
