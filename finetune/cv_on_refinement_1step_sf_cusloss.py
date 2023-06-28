@@ -18,14 +18,27 @@ Fine-Tune StarCoder on Code Alpaca/SE
 
 from torch.nn import CrossEntropyLoss
 from transformers.trainer import logger, is_sagemaker_mp_enabled, load_sharded_checkpoint, get_last_checkpoint
+from transformers.trainer import unwrap_model, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES, Dict, Any, Union
 class MyTrainer(Trainer):
     def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
         return
     def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+
+        Subclass and override for custom behavior.
+        """
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+
         assert self.label_smoother is None
+        assert "labels_loss_mask" in inputs, f"labels_loss_mask not in inputs: {inputs.keys()}"
+        labels_loss_mask = inputs.pop("labels_loss_mask")
         assert "labels" in inputs
         labels = inputs.pop("labels",)
-        outputs = model(**inputs, output_hidden_states=True,)
+        outputs = model(**inputs)
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
         if self.args.past_index >= 0:
@@ -34,19 +47,14 @@ class MyTrainer(Trainer):
         assert isinstance(outputs, dict)
         assert "loss" not in outputs
 
-        hidden_states = outputs["hidden_states"][-1]
-        lm_logits = model.score(hidden_states)
-        # shift_logits = lm_logits[..., :-1, :].contiguous().view(-1, lm_logits.size(-1))
-        # shift_labels = labels[..., 1:].contiguous().to(shift_logits.device).view(-1)
-        shift_logits = lm_logits.contiguous().view(-1, lm_logits.size(-1))
-        shift_labels = labels.contiguous().to(shift_logits.device).view(-1)
-        assert shift_logits.size(0) == shift_labels.size(0)
-
-        shift_logits = shift_logits[shift_labels > 0]
-        shift_labels = shift_labels[shift_labels > 0] - 1
-
-        loss_fct = CrossEntropyLoss()
-        loss = loss_fct(shift_logits, shift_labels)
+        lm_logits = outputs["logits"]
+        shift_logits = lm_logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
+        shift_labels_loss_mask = labels_loss_mask[..., 1:].contiguous().to(shift_logits.device)
+        loss_fct = CrossEntropyLoss(reduction="none")
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1),)
+        loss = loss[shift_labels_loss_mask.view(-1) == 1]
+        loss = loss.mean()
         outputs["loss"] = loss
 
         # We don't use .loss here since the model may return tuples instead of ModelOutput.
@@ -79,7 +87,7 @@ def get_args():
     parser.add_argument("--dataset_name", type=str, default="openai_humaneval")
     parser.add_argument("--subset", type=str)
     parser.add_argument("--split", type=str)
-    parser.add_argument("--size_valid_set", type=int, default=128)
+    parser.add_argument("--size_valid_set", type=int, default=10000)
     parser.add_argument("--streaming", action="store_true")
     parser.add_argument("--shuffle_buffer", type=int, default=5000)
 
@@ -125,7 +133,7 @@ def chars_token_ratio(dataset, tokenizer, input_column_name="prompt", output_col
     """
     total_characters, total_tokens = 0, 0
     for _, example in tqdm(zip(range(nb_examples), iter(dataset)), total=nb_examples):
-        text = prepare_sample_text(example, input_column_name, output_column_name)
+        text = ''.join(prepare_sample_text(example, input_column_name, output_column_name))
         total_characters += len(text)
         if tokenizer.is_fast:
             total_tokens += len(tokenizer(text).tokens())
@@ -152,8 +160,7 @@ def print_trainable_parameters(model):
 
 def prepare_sample_text(example, input_column_name="prompt", output_column_name="completion"):
     """Prepare the text from a sample of the dataset."""
-    text = example[args.input_column_name].strip()
-    return text
+    return f"{example[args.input_column_name].strip()}\n # Feedback: The code above is incorrect. Please fix it.\n\n", f"{example[args.output_column_name].strip()}"
 
 
 class ConstantLengthDataset(IterableDataset):
@@ -194,16 +201,12 @@ class ConstantLengthDataset(IterableDataset):
         more_examples = True
         while more_examples:
             buffer, buffer_len = [], 0
-            labels_buffer = []
             while True:
                 if buffer_len >= self.max_buffer_size:
                     break
                 try:
-                    example = next(iterator)
-                    buffer.append(prepare_sample_text(example, self.input_column_name, self.output_column_name))
-                    assert isinstance(example['passed'], bool)
-                    labels_buffer.append(example['passed'])
-                    buffer_len += len(buffer[-1])
+                    buffer.extend(prepare_sample_text(next(iterator), self.input_column_name, self.output_column_name))
+                    buffer_len += sum([len(bf) for bf in buffer[-1]])
                 except StopIteration:
                     if self.infinite:
                         iterator = iter(self.dataset)
@@ -211,20 +214,25 @@ class ConstantLengthDataset(IterableDataset):
                         more_examples = False
                         break
             tokenized_inputs = self.tokenizer(buffer, truncation=False)["input_ids"]
-            assert len(tokenized_inputs) == len(labels_buffer)
             all_token_ids = []
-            all_labels_ids = []
-            for tokenized_input, label in zip(tokenized_inputs, labels_buffer):
-                all_token_ids.extend(tokenized_input + [self.concat_token_id])
-                all_labels_ids.extend([0] * len(tokenized_input) + [1 if label else 2]) # 1 for passed, 2 for failed, FIRST LOGITS IS FOR PASSED
+            all_token_ids_loss_mask = []
+            assert len(tokenized_inputs) % 2 == 0
+            for tokenized_input_no_loss, tokenized_input_in_loss in zip(
+                tokenized_inputs[::2], tokenized_inputs[1::2]
+            ):
+                all_token_ids.extend(tokenized_input_no_loss)
+                all_token_ids_loss_mask.extend([0] * len(tokenized_input_no_loss))
+                all_token_ids.extend(tokenized_input_in_loss + [self.concat_token_id])
+                all_token_ids_loss_mask.extend([1] * (len(tokenized_input_in_loss) + 1))
             for i in range(0, len(all_token_ids), self.seq_length):
                 input_ids = all_token_ids[i : i + self.seq_length]
-                labels_ids = all_labels_ids[i : i + self.seq_length]
+                input_ids_loss_mask = all_token_ids_loss_mask[i : i + self.seq_length]
                 if len(input_ids) == self.seq_length:
                     self.current_size += 1
                     yield {
                         "input_ids": torch.LongTensor(input_ids),
-                        "labels": torch.LongTensor(labels_ids),
+                        "labels": torch.LongTensor(input_ids),
+                        "labels_loss_mask": torch.LongTensor(input_ids_loss_mask),
                     }
 
 def split_index(n, k, d):
@@ -255,7 +263,7 @@ def create_datasets(tokenizer, args):
         train_data = train_data.shuffle(buffer_size=args.shuffle_buffer, seed=args.seed)
     else:
         train_data = dataset["train"]
-        valid_data = dataset["test"].select(range(args.size_valid_set))
+        valid_data = dataset["test"]
         print(f"Size of the train set: {len(train_data)}. Size of the validation set: {len(valid_data)}")
 
     chars_per_token = chars_token_ratio(train_data, tokenizer, args.input_column_name, args.output_column_name)
@@ -281,34 +289,25 @@ def create_datasets(tokenizer, args):
     )
     return train_dataset, valid_dataset
 
-import numpy as np
-def my_compute_metrics(eval_pred):
-    print('mmm', eval_pred)
-    logits, labels = eval_pred
-    predictions = np.argmax(logits, axis=-1)
-    return {"accuracy": (predictions == labels).mean()}
 
-from transformers import AutoModelForSequenceClassification
 def run_training(args, train_data, val_data):
     print("Loading the model")
     # disable caching mechanism when using gradient checkpointing
     # model = AutoModelForCausalLM.from_pretrained(
-    model = AutoModelForSequenceClassification.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         use_auth_token=True,
         use_cache=not args.no_gradient_checkpointing,
         load_in_8bit=True,
         device_map={"": Accelerator().process_index},
     )
-    print(model)
-
-    # model = MySeqClassificationModel(model)
 
     model = prepare_model_for_kbit_training(model)
 
     if args.resume_from_checkpoint:
         if isinstance(args.resume_from_checkpoint, bool):
             args.resume_from_checkpoint = get_last_checkpoint(args.output_dir)
+
     if not args.resume_from_checkpoint:
         lora_config = LoraConfig(
             r=args.lora_r,
@@ -347,14 +346,14 @@ def run_training(args, train_data, val_data):
         fp16=not args.no_fp16,
         bf16=args.bf16,
         weight_decay=args.weight_decay,
-        run_name="StarCoder-cv-on-verification-fold-{}-seed-{}".format(args.fold, args.seed),
+        run_name="StarCoder-cross-validation-fold-{}-seed-{}".format(args.fold, args.seed),
         report_to="wandb",
         ddp_find_unused_parameters=False,
         load_best_model_at_end=True,
         resume_from_checkpoint=args.resume_from_checkpoint,
+        remove_unused_columns=False,
     )
 
-    # trainer = MyTrainer(model=model, args=training_args, train_dataset=train_data, eval_dataset=val_data, callbacks=[LoadBestPeftModelCallback], compute_metrics=my_compute_metrics)
     trainer = MyTrainer(model=model, args=training_args, train_dataset=train_data, eval_dataset=val_data, callbacks=[LoadBestPeftModelCallback])
 
     print("Training...")
