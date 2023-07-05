@@ -209,7 +209,7 @@ def create_datasets(tokenizer, args):
     test_task_ids = [example['task_id'] for example in dataset['test']]
 
     true_dataset = load_dataset('json', data_files={'test': args.dataset_name}, split=args.split, streaming=args.streaming)
-    true_dataset_len = len(true_dataset)
+    true_dataset_len = len(true_dataset['test'])
     true_train_split_index = [i for i in range(true_dataset_len) if true_dataset['test'][i]['task_id'] in train_task_ids]
     true_test_split_index = [i for i in range(true_dataset_len) if true_dataset['test'][i]['task_id'] in test_task_ids]
     true_dataset['train'] = true_dataset['test'].select(true_train_split_index)
