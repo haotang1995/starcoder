@@ -101,6 +101,9 @@ def main_humaneval(append):
         for gen, eval_res in zip(append_data[i], eval_results[i]):
             assert(example['prompt'].strip() in gen), f'prompt not in gen: {example["prompt"]} vs {gen}'
             example['starcoder_generation'] = gen
+            if 'task_id' in eval_res:
+                eval_res.pop('task_id')
+                assert 'task_id' not in eval_res
             example.update(eval_res)
             new_dataset.append(example)
     assert(len(new_dataset) == len(dataset)*sample_num), f'new_dataset length error: {len(new_dataset)} vs {len(dataset)*sample_num}'

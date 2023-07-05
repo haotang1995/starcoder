@@ -18,6 +18,31 @@ def get_args():
     args = parser.parse_args()
     return args
 
+
+def main_humaneval(append):
+    out_filename = osp.join(datadir, osp.basename(append))
+    if osp.exists(out_filename):
+        print(f'{out_filename} already exists, skip')
+        return
+
+    dataset = load_dataset('openai_humaneval',)['test']
+    with open(append, 'r') as f:
+        append_data = json.load(f)
+    assert(len(dataset) == len(append_data)), f'dataset and append_data must have same length: {len(dataset)} vs {len(append_data)}'
+    sample_num = len(append_data[0])
+
+    new_dataset = []
+    for i, example in enumerate(dataset):
+        for gen in append_data[i]:
+            assert(example['prompt'].strip() in gen), f'prompt not in gen: {example["prompt"]} vs {gen}'
+            example['starcoder_generation'] = gen
+            example['refinement_output'] = example['prompt'] + '\n' + example['canonical_solution']
+            new_dataset.append(example)
+    assert(len(new_dataset) == len(dataset)*sample_num), f'new_dataset length error: {len(new_dataset)} vs {len(dataset)*sample_num}'
+
+    with open(out_filename, 'w') as f:
+        json.dump(new_dataset, f)
+
 def mbpp_preprocess(example):
     prompt = example["prompt"]
     code = example["code"]
@@ -73,16 +98,33 @@ def mbpp_preprocess(example):
 
     example["prompt"] = new_prompt
     example["code"] = new_code
+    example["canonical_solution"] = new_code
+    example["entry_point"] = func_name
+    assert all([func_name in test for test in example["test_list"]])
+    example["test"] = 'def check(candidate)\n' + '\n'.join([indent+test.replace(func_name, 'candidate') for test in example["test_list"]])
     return example
 
-
-def main_humaneval(append):
+def main_mbpp(append):
     out_filename = osp.join(datadir, osp.basename(append))
     if osp.exists(out_filename):
         print(f'{out_filename} already exists, skip')
         return
 
-    dataset = load_dataset('openai_humaneval',)['test']
+    dataset = load_dataset(
+        'mbpp',
+        'sanitized',
+        use_auth_token=True,
+    )
+    dataset = dataset.map(mbpp_preprocess,)
+    dataset['test'] = concatenate_datasets([
+        dataset['train'],
+        dataset['validation'],
+        dataset['test'],
+        dataset['prompt']
+    ])
+
+    dataset = dataset['test']
+
     with open(append, 'r') as f:
         append_data = json.load(f)
     assert(len(dataset) == len(append_data)), f'dataset and append_data must have same length: {len(dataset)} vs {len(append_data)}'
@@ -99,18 +141,6 @@ def main_humaneval(append):
 
     with open(out_filename, 'w') as f:
         json.dump(new_dataset, f)
-
-
-def main_mbpp(append):
-    assert False, "Current MBPP generations are generated using the original format inside of the HumanEval format"
-    dataset = load_dataset('mbpp', 'santized', use_auth_token=True)
-    dataset = dataset.map(mbpp_preprocess,)
-    dataset = concatenate_datasets([dataset['train'], dataset['validation'], dataset['test'], dataset['prompt']])
-
-    with open(append, 'r') as f:
-        append_data = json.load(f)
-
-    assert(len(dataset) == len(append_data)), f'dataset and append_data must have same length: {len(dataset)} vs {len(append_data)}'
 
 if __name__ == '__main__':
     args = get_args()
